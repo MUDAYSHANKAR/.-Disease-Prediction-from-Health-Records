@@ -1,0 +1,263 @@
+
+print("--- Installing required libraries ---")
+!pip install xgboost lime -q
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import lime
+import lime.lime_tabular
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score,
+                             RocCurveDisplay, precision_recall_curve, auc, PrecisionRecallDisplay)
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+print("Libraries imported successfully.")
+def simulate_ehr_data(n_patients=5000):
+    print("\n--- Simulating Realistic EHR Data ---")
+
+    # Class imbalance: ~5% of patients have the disease (e.g., Sepsis)
+    sepsis_prevalence = 0.05
+    has_sepsis = np.random.choice([1, 0], size=n_patients, p=[sepsis_prevalence, 1 - sepsis_prevalence])
+
+    # Demographics
+    age = np.random.normal(loc=60, scale=15, size=n_patients).clip(18, 100)
+    gender = np.random.choice([0, 1], size=n_patients, p=[0.5, 0.5]) # 0: Female, 1: Male
+
+    # Vitals and Labs - values are different for sepsis vs. non-sepsis patients
+    # This creates the signal the model needs to find.
+    heart_rate = np.random.normal(loc=np.where(has_sepsis, 110, 75), scale=15, size=n_patients)
+    temperature = np.random.normal(loc=np.where(has_sepsis, 38.5, 36.8), scale=0.5, size=n_patients)
+    wbc_count = np.random.normal(loc=np.where(has_sepsis, 18, 8), scale=4, size=n_patients).clip(1, 40)
+    lactate = np.random.normal(loc=np.where(has_sepsis, 3.5, 1.2), scale=1, size=n_patients).clip(0.5, 10)
+
+    df = pd.DataFrame({
+        'age': age,
+        'gender': gender,
+        'heart_rate': heart_rate,
+        'temperature': temperature,
+        'wbc_count': wbc_count, # White Blood Cell Count
+        'lactate': lactate,
+        'has_sepsis': has_sepsis
+    })
+
+    # Introduce missing data (sparsity)
+    # Some features are more likely to be missing than others.
+    for col, missing_frac in [('heart_rate', 0.1), ('temperature', 0.15), ('wbc_count', 0.3), ('lactate', 0.55)]:
+        missing_indices = df.sample(frac=missing_frac).index
+        df.loc[missing_indices, col] = np.nan
+
+    print(f"Generated {n_patients} patient records.")
+    return df
+
+# Create the dataset
+df = simulate_ehr_data()
+print("\nSample of the generated data:")
+print(df.head())
+
+
+# ==============================================================================
+# 3. EXPLORATORY DATA ANALYSIS (EDA)
+# ==============================================================================
+print("\n--- Performing Exploratory Data Analysis ---")
+
+# 3.1. Check for missing data (sparsity)
+print("\nMissing values per column:")
+print(df.isnull().sum() / len(df) * 100)
+
+# 3.2. Check for class imbalance
+plt.figure(figsize=(6, 4))
+sns.countplot(x='has_sepsis', data=df)
+plt.title('Class Distribution (0: No Sepsis, 1: Sepsis)')
+plt.ylabel('Number of Patients')
+plt.show()
+
+
+# ==============================================================================
+# 4. DATA PREPROCESSING AND MODEL PIPELINE
+# ==============================================================================
+print("\n--- Setting up Preprocessing and Modeling Pipeline ---")
+
+# Define features (X) and target (y)
+X = df.drop('has_sepsis', axis=1)
+y = df['has_sepsis']
+feature_names = X.columns.tolist()
+
+# Split data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, random_state=42, stratify=y # Stratify ensures imbalance is preserved
+)
+
+# Handle class imbalance by calculating scale_pos_weight for XGBoost
+# Formula: count(negative_class) / count(positive_class)
+scale_pos_weight = y_train.value_counts()[0] / y_train.value_counts()[1]
+print(f"Calculated scale_pos_weight for class imbalance: {scale_pos_weight:.2f}")
+
+# Create a preprocessing and modeling pipeline
+# This is crucial to prevent data leakage from the test set
+pipeline = Pipeline([
+    # Step 1: Impute missing values with the median. Median is robust to outliers.
+    ('imputer', SimpleImputer(strategy='median')),
+
+    # Step 2: Scale features to have zero mean and unit variance.
+    ('scaler', StandardScaler()),
+
+    # Step 3: The XGBoost Classifier model
+    ('xgb', xgb.XGBClassifier(
+        objective='binary:logistic',
+        use_label_encoder=False,
+        eval_metric='logloss',
+        scale_pos_weight=scale_pos_weight, # This is the key to handling imbalance
+        random_state=42
+    ))
+])
+
+print("Pipeline created successfully.")
+
+
+# ==============================================================================
+# 5. MODEL TRAINING AND EVALUATION
+# ==============================================================================
+print("\n--- Training the XGBoost Model ---")
+
+# Train the entire pipeline on the training data
+pipeline.fit(X_train, y_train)
+print("Model training complete.")
+
+# Make predictions on the test set
+y_pred = pipeline.predict(X_test)
+y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
+
+# --- Evaluation ---
+# Because of class imbalance, accuracy is a poor metric.
+# We focus on metrics that are sensitive to the minority class.
+print("\n--- Model Evaluation on Test Set ---")
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred, target_names=['No Sepsis', 'Sepsis']))
+
+print("\nConfusion Matrix:")
+cm = confusion_matrix(y_test, y_pred)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['No Sepsis', 'Sepsis'], yticklabels=['No Sepsis', 'Sepsis'])
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix')
+plt.show()
+
+# Plot ROC-AUC and Precision-Recall Curves
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+# ROC-AUC
+roc_auc = roc_auc_score(y_test, y_pred_proba)
+RocCurveDisplay.from_estimator(pipeline, X_test, y_test, ax=ax1)
+ax1.set_title(f'ROC Curve (AUC = {roc_auc:.2f})')
+
+# Precision-Recall
+prec, recall, _ = precision_recall_curve(y_test, y_pred_proba)
+pr_auc = auc(recall, prec)
+PrecisionRecallDisplay(precision=prec, recall=recall).plot(ax=ax2)
+ax2.set_title(f'Precision-Recall Curve (AUC = {pr_auc:.2f})')
+
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# 6. MODEL INTERPRETABILITY WITH LIME
+# ==============================================================================
+print("\n--- Explaining Model Predictions with LIME ---")
+
+# LIME (Local Interpretable Model-agnostic Explanations) explains a single prediction.
+# We need to create a LIME explainer object.
+# It needs the training data (as a numpy array), feature names, class names, and mode.
+explainer = lime.lime_tabular.LimeTabularExplainer(
+    training_data=pipeline.named_steps['scaler'].transform(pipeline.named_steps['imputer'].transform(X_train.values)),
+    feature_names=feature_names,
+    class_names=['No Sepsis', 'Sepsis'],
+    mode='classification'
+)
+
+# --- Explain a "True Positive" case ---
+# Find a patient in the test set that the model correctly predicted as having sepsis.
+true_positive_idx = np.where((y_test == 1) & (y_pred == 1))[0]
+if len(true_positive_idx) > 0:
+    case_idx = true_positive_idx[0]
+    print(f"\nExplaining a TRUE POSITIVE case (Patient index {case_idx} in test set):")
+
+    # Get the raw data for this patient to see their values
+    print("Patient's Raw Data:")
+    print(X_test.iloc[[case_idx]])
+
+    # Generate the explanation
+    explanation_tp = explainer.explain_instance(
+        data_row=X_test.iloc[case_idx].values,
+        predict_fn=pipeline.predict_proba
+    )
+
+    # Display the explanation
+    explanation_tp.show_in_notebook(show_table=True, show_all=False)
+else:
+    print("\nCould not find a True Positive case in the test set to explain.")
+
+
+# --- Explain a "True Negative" case ---
+# Find a patient in the test set that the model correctly predicted as NOT having sepsis.
+true_negative_idx = np.where((y_test == 0) & (y_pred == 0))[0]
+if len(true_negative_idx) > 0:
+    case_idx = true_negative_idx[0]
+    print(f"\nExplaining a TRUE NEGATIVE case (Patient index {case_idx} in test set):")
+
+    # Get the raw data for this patient
+    print("Patient's Raw Data:")
+    print(X_test.iloc[[case_idx]])
+
+    # Generate the explanation
+    explanation_tn = explainer.explain_instance(
+        data_row=X_test.iloc[case_idx].values,
+        predict_fn=pipeline.predict_proba
+    )
+
+    # Display the explanation
+    explanation_tn.show_in_notebook(show_table=True, show_all=False)
+else:
+    print("\nCould not find a True Negative case in the test set to explain.")
+
+# ==============================================================================
+# 7. DISCUSSION
+# ==============================================================================
+print("""
+--- Discussion & Real-World Considerations ---
+
+This notebook provides a complete workflow for a common EHR prediction task.
+
+Key Challenges Addressed:
+1.  **Data Sparsity:** We used `SimpleImputer` with a median strategy. In a real project,
+    more sophisticated methods like k-NN imputation or model-based imputation might
+    yield better results. It's also common to create a new binary feature indicating
+    if a value was originally missing, as the 'missingness' itself can be predictive.
+
+2.  **Class Imbalance:** We used XGBoost's `scale_pos_weight` parameter, which is a very
+    effective and computationally cheap way to handle imbalance. Alternatives include
+    resampling techniques like SMOTE (oversampling the minority class) or RandomUnderSampler.
+
+3.  **Interpretability:** LIME provides crucial local explanations, showing which
+    features drove the prediction for a specific patient. This is essential for gaining
+    clinicians' trust. The LIME plots clearly show features like high lactate and
+    high WBC count pushing the prediction towards "Sepsis," which aligns with clinical knowledge.
+
+4.  **Privacy:** By simulating data, we completely avoided the privacy and access
+    hurdles of real EHR datasets like MIMIC-III. Any real-world project MUST begin
+    with a rigorous data governance and ethics review.
+
+Next Steps for a Real Project:
+- **Sequential Modeling (RNN/LSTM):** This notebook used a static, tabular approach.
+  Real EHR data is a time series (e.g., multiple heart rate measurements over a hospital
+  stay). Recurrent Neural Networks (RNNs) or LSTMs are better suited to capture these
+  temporal dynamics and could significantly improve predictive performance.
+- **Feature Engineering:** Creating more sophisticated features (e.g., the slope of
+  a lab value over time, time since last measurement) is critical.
+- **Hyperparameter Tuning:** Using tools like Optuna or GridSearchCV to find the optimal
+  settings for the XGBoost model would likely boost performance further.
+""")
